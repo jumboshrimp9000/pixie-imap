@@ -1,0 +1,18 @@
+name: Deploy pixie-imap
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.198.126.147
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /opt/pixie/imap-proxy && git pull && systemctl restart pixie-imap
