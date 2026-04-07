@@ -1,0 +1,5 @@
+config.json
+emailproxy.config
+.env
+__pycache__/
+*.pyc
