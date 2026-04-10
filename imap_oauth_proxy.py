@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# =============================================================================
+# SECURITY WARNING — AUTH BYPASS (DO NOT RUN IN PRODUCTION)
+#
+# This proxy accepts any IMAP LOGIN password and authenticates to Microsoft via
+# OAuth client_credentials. That means *anyone* who can reach the IMAP port can
+# read *any configured mailbox* by logging in with a known email address.
+#
+# The proxy MUST remain disabled until it is redesigned to validate a per‑mailbox
+# app password issued by our app *before* establishing the upstream OAuth bridge.
+#
+# See SECURITY.md in this directory for the full risk description and the
+# required redesign. This file contains a hard‑disable guard; do not remove it.
+# =============================================================================
 """
 Simple Inboxes IMAP OAuth Proxy
 
@@ -42,6 +55,12 @@ def load_config():
     with open(CONFIG_PATH) as f:
         config = json.load(f)
     log.info("Loaded config: %d tenant(s)", len(config.get("tenants", {})))
+
+
+def is_disabled() -> bool:
+    if os.getenv("DISABLED") is not None:
+        return True
+    return config.get("disabled") is True
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +281,9 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
 # ---------------------------------------------------------------------------
 async def main():
     load_config()
+    if is_disabled():
+        log.error("REFUSING TO START — see SECURITY.md")
+        sys.exit(1)
 
     # SSL context for client-facing side
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
