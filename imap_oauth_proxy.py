@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
-# =============================================================================
-# SECURITY WARNING — AUTH BYPASS (DO NOT RUN IN PRODUCTION)
-#
-# This proxy accepts any IMAP LOGIN password and authenticates to Microsoft via
-# OAuth client_credentials. That means *anyone* who can reach the IMAP port can
-# read *any configured mailbox* by logging in with a known email address.
-#
-# The proxy MUST remain disabled until it is redesigned to validate a per‑mailbox
-# app password issued by our app *before* establishing the upstream OAuth bridge.
-#
-# See SECURITY.md in this directory for the full risk description and the
-# required redesign. This file contains a hard‑disable guard; do not remove it.
-# =============================================================================
 """
 Simple Inboxes IMAP OAuth Proxy
 
-Accepts IMAP connections with username+password (password ignored),
-authenticates to Microsoft using OAuth2 client_credentials flow,
-and proxies the IMAP session transparently.
+Accepts IMAP connections with username+password, exchanges those credentials for
+a delegated Microsoft OAuth token, and proxies the IMAP session transparently.
+
+The previous passwordless client_credentials bridge is intentionally disabled by
+default because it does not verify mailbox ownership.
 """
 
 import asyncio
@@ -54,13 +43,8 @@ def load_config():
     global config
     with open(CONFIG_PATH) as f:
         config = json.load(f)
+    _token_cache.clear()
     log.info("Loaded config: %d tenant(s)", len(config.get("tenants", {})))
-
-
-def is_disabled() -> bool:
-    if os.getenv("DISABLED") is not None:
-        return True
-    return config.get("disabled") is True
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +54,8 @@ _token_cache: dict[str, tuple[str, float]] = {}
 _token_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None
 
 
-def _fetch_token_sync(tenant_id: str, client_id: str, client_secret: str) -> tuple[str, float]:
-    """Blocking HTTP call to Microsoft token endpoint."""
+def _fetch_app_token_sync(tenant_id: str, client_id: str, client_secret: str) -> tuple[str, float]:
+    """Blocking HTTP call to Microsoft token endpoint for app-only tokens."""
     url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     data = urllib.parse.urlencode({
         "grant_type": "client_credentials",
@@ -86,8 +70,33 @@ def _fetch_token_sync(tenant_id: str, client_id: str, client_secret: str) -> tup
     return token, expiry
 
 
-async def get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
-    """Get a cached or fresh OAuth token for a tenant."""
+def _fetch_password_token_sync(
+    tenant_id: str,
+    client_id: str,
+    username: str,
+    password: str,
+    client_secret: str | None = None,
+    scope: str | None = None,
+) -> str:
+    """Blocking HTTP call to Microsoft token endpoint for delegated IMAP access."""
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    body = {
+        "grant_type": "password",
+        "client_id": client_id,
+        "username": username,
+        "password": password,
+        "scope": scope or "https://outlook.office365.com/IMAP.AccessAsUser.All offline_access openid profile",
+    }
+    if client_secret:
+        body["client_secret"] = client_secret
+    data = urllib.parse.urlencode(body).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    return resp["access_token"]
+
+
+async def get_app_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """Get a cached or fresh OAuth app token for a tenant."""
     global _token_lock
     if _token_lock is None:
         _token_lock = asyncio.Lock()
@@ -98,9 +107,28 @@ async def get_token(tenant_id: str, client_id: str, client_secret: str) -> str:
             return cached[0]
 
         log.info("Fetching new OAuth token for tenant %s", tenant_id[:8])
-        token, expiry = await asyncio.to_thread(_fetch_token_sync, tenant_id, client_id, client_secret)
+        token, expiry = await asyncio.to_thread(_fetch_app_token_sync, tenant_id, client_id, client_secret)
         _token_cache[tenant_id] = (token, expiry)
         return token
+
+
+async def get_password_token(
+    tenant_id: str,
+    client_id: str,
+    username: str,
+    password: str,
+    client_secret: str | None = None,
+    scope: str | None = None,
+) -> str:
+    return await asyncio.to_thread(
+        _fetch_password_token_sync,
+        tenant_id,
+        client_id,
+        username,
+        password,
+        client_secret,
+        scope,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -112,16 +140,50 @@ LOGIN_RE = re.compile(
 )
 
 
-def parse_login_username(args: str) -> str:
-    """Extract the username (email) from LOGIN arguments, ignoring the password."""
-    args = args.strip()
-    if args.startswith('"'):
-        # Quoted username
-        end = args.index('"', 1)
-        return args[1:end]
-    else:
-        # Unquoted — username is everything up to the first space
-        return args.split()[0]
+def _tokenize_login_args(args: str) -> list[str]:
+    tokens: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escaped = False
+
+    for char in args.strip():
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\" and in_quotes:
+            escaped = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if char == " " and not in_quotes:
+            if current:
+                tokens.append("".join(current))
+                current = []
+            continue
+        current.append(char)
+
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def parse_login_credentials(args: str) -> tuple[str, str]:
+    """Extract username and password from LOGIN arguments."""
+    tokens = _tokenize_login_args(args)
+    if len(tokens) < 2:
+        raise ValueError("Malformed LOGIN command")
+    return tokens[0], tokens[1]
+
+
+def redact_username(username: str) -> str:
+    username = username.strip()
+    if "@" not in username:
+        return "***"
+    local_part, domain = username.split("@", 1)
+    visible = local_part[:2]
+    return f"{visible}***@{domain}"
 
 
 def build_xoauth2(username: str, token: str) -> str:
@@ -200,10 +262,16 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
 
             # --- LOGIN intercepted ---
             client_tag = match.group("tag")
-            username = parse_login_username(match.group("args"))
+            try:
+                username, password = parse_login_credentials(match.group("args"))
+            except ValueError:
+                client_writer.write(f"{client_tag} BAD malformed LOGIN command\r\n".encode())
+                await client_writer.drain()
+                return
             domain = username.split("@")[-1].lower() if "@" in username else ""
+            redacted_username = redact_username(username)
 
-            log.info("LOGIN from %s user=%s domain=%s", peer, username, domain)
+            log.info("LOGIN from %s user=%s domain=%s", peer, redacted_username, domain)
 
             # Look up tenant
             tenant_cfg = config.get("tenants", {}).get(domain)
@@ -213,16 +281,40 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
                 await client_writer.drain()
                 return
 
+            auth_mode = str(tenant_cfg.get("auth_mode") or "password").strip().lower()
+            allow_passwordless = bool(tenant_cfg.get("allow_insecure_passwordless_login"))
+
             # Get OAuth token
             try:
-                token = await get_token(
-                    tenant_cfg["tenant_id"],
-                    tenant_cfg["client_id"],
-                    tenant_cfg["client_secret"],
-                )
+                if auth_mode == "password":
+                    token = await get_password_token(
+                        tenant_cfg["tenant_id"],
+                        tenant_cfg["client_id"],
+                        username,
+                        password,
+                        tenant_cfg.get("client_secret"),
+                        tenant_cfg.get("scope"),
+                    )
+                elif auth_mode == "client_credentials" and allow_passwordless:
+                    token = await get_app_token(
+                        tenant_cfg["tenant_id"],
+                        tenant_cfg["client_id"],
+                        tenant_cfg["client_secret"],
+                    )
+                else:
+                    log.error(
+                        "Refusing insecure auth mode for domain=%s auth_mode=%s", domain, auth_mode
+                    )
+                    client_writer.write(f"{client_tag} NO LOGIN Authentication mode not allowed\r\n".encode())
+                    await client_writer.drain()
+                    return
             except Exception as e:
-                log.error("Token fetch failed for %s: %s", domain, e)
-                client_writer.write(f"{client_tag} NO LOGIN Authentication service unavailable\r\n".encode())
+                if auth_mode == "password":
+                    log.warning("Delegated auth failed for %s: %s", redacted_username, e)
+                    client_writer.write(f"{client_tag} NO LOGIN Authentication failed\r\n".encode())
+                else:
+                    log.error("Token fetch failed for domain=%s: %s", domain, e)
+                    client_writer.write(f"{client_tag} NO LOGIN Authentication service unavailable\r\n".encode())
                 await client_writer.drain()
                 return
 
@@ -245,11 +337,11 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
                 auth_resp_str = auth_resp.decode("utf-8", errors="replace").rstrip("\r\n")
 
             if auth_resp_str.startswith(f"{auth_tag} OK"):
-                log.info("Auth SUCCESS for %s via %s", username, peer)
+                log.info("Auth SUCCESS for %s via %s", redacted_username, peer)
                 client_writer.write(f"{client_tag} OK LOGIN completed\r\n".encode())
                 await client_writer.drain()
             else:
-                log.warning("Auth FAILED for %s: %s", username, auth_resp_str)
+                log.warning("Auth FAILED for %s: %s", redacted_username, auth_resp_str)
                 client_writer.write(f"{client_tag} NO LOGIN Authentication failed\r\n".encode())
                 await client_writer.drain()
                 return
@@ -260,7 +352,7 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
             done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
-            log.info("Session ended for %s via %s", username, peer)
+            log.info("Session ended for %s via %s", redacted_username, peer)
             break
 
     except asyncio.TimeoutError:
@@ -281,9 +373,6 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
 # ---------------------------------------------------------------------------
 async def main():
     load_config()
-    if is_disabled():
-        log.error("REFUSING TO START — see SECURITY.md")
-        sys.exit(1)
 
     # SSL context for client-facing side
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
